@@ -30,6 +30,7 @@ import android.bluetooth.BluetoothGattCharacteristic as GC
 import android.bluetooth.BluetoothGattDescriptor as GD
 import android.bluetooth.le.*
 import java.util.UUID
+import java.util.concurrent.Executors
 
 // ---------- HID report descriptor: keyboard (ID 1) + consumer control (ID 2) ----------
 private val DESC = intArrayOf(
@@ -70,6 +71,47 @@ class HidRemote(private val ctx: Context) {
     private val kbd = GC(U(0x2A4D), GC.PROPERTY_READ or GC.PROPERTY_NOTIFY, GC.PERMISSION_READ_ENCRYPTED)
     private val con = GC(U(0x2A4D), GC.PROPERTY_READ or GC.PROPERTY_NOTIFY, GC.PERMISSION_READ_ENCRYPTED)
     private val ui = Handler(Looper.getMainLooper())
+    private var ble = "starting"
+    private var cls = "starting"
+    private var chid: BluetoothHidDevice? = null
+    private var chost: BluetoothDevice? = null
+    private var classicStarted = false
+    private fun upd() { status.value = "BLE: $ble\nClassic: $cls" }
+
+    private val ccb = object : BluetoothHidDevice.Callback() {
+        override fun onConnectionStateChanged(d: BluetoothDevice, st: Int) {
+            if (st == BluetoothProfile.STATE_CONNECTED) { chost = d; cls = "connected to ${d.name ?: d.address}"; upd() }
+            else if (d == chost) { chost = null; cls = "disconnected"; upd() }
+        }
+    }
+    private val bondRx = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            @Suppress("DEPRECATION")
+            val d = i.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
+            if (i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, 0) == BluetoothDevice.BOND_BONDED && host == null) chid?.connect(d)
+        }
+    }
+    private fun startClassic(a: BluetoothAdapter) {
+        if (classicStarted) return
+        classicStarted = true
+        ctx.registerReceiver(bondRx, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
+        val ok = a.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(p: Int, proxy: BluetoothProfile) {
+                val h = proxy as BluetoothHidDevice
+                chid = h
+                val sdp = BluetoothHidDeviceAppSdpSettings("RC-525G Phone", "Remote Control", "Acer",
+                    BluetoothHidDevice.SUBCLASS1_COMBO, DESC)
+                cls = if (h.registerApp(sdp, null, null, Executors.newSingleThreadExecutor(), ccb)) "registered" else "registerApp FAILED"
+                upd()
+            }
+            override fun onServiceDisconnected(p: Int) { chid = null }
+        }, BluetoothProfile.HID_DEVICE)
+        if (!ok) { cls = "NOT supported by this phone"; upd() }
+    }
+    private fun out(id: Int, c: GC, d: ByteArray) {
+        nfy(c, d)
+        chost?.let { chid?.sendReport(it, id, d) }
+    }
 
     private fun ro(u: Int, v: ByteArray, enc: Boolean) =
         GC(U(u), GC.PROPERTY_READ, if (enc) GC.PERMISSION_READ_ENCRYPTED else GC.PERMISSION_READ).also { it.setValue(v) }
@@ -113,10 +155,10 @@ class HidRemote(private val ctx: Context) {
         override fun onServiceAdded(st: Int, service: BluetoothGattService) { addNext() }
         override fun onConnectionStateChange(d: BluetoothDevice, st: Int, ns: Int) {
             if (ns == BluetoothProfile.STATE_CONNECTED) {
-                host = d; status.value = "Connected to ${d.name ?: d.address}"
+                host = d; ble = "connected to ${d.name ?: d.address}"; upd()
             } else {
                 if (d == host) host = null
-                status.value = "Disconnected. Waiting for TV…"
+                ble = "disconnected, advertising again"; upd()
                 advertise()
             }
         }
@@ -140,9 +182,9 @@ class HidRemote(private val ctx: Context) {
 
     private val advCb = object : AdvertiseCallback() {
         override fun onStartSuccess(s: AdvertiseSettings) {
-            if (host == null) status.value = "Pairing mode ON. On the TV pick “RC-525G Phone”"
+            if (host == null) { ble = "advertising OK"; upd() }
         }
-        override fun onStartFailure(e: Int) { if (e != ADVERTISE_FAILED_ALREADY_STARTED) status.value = "Advertising failed (code $e)" }
+        override fun onStartFailure(e: Int) { if (e != ADVERTISE_FAILED_ALREADY_STARTED) { ble = "advertising FAILED, code $e"; upd() } }
     }
 
     private fun advertise() {
@@ -150,7 +192,7 @@ class HidRemote(private val ctx: Context) {
         adv.stopAdvertising(advCb)
         val set = AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH).setConnectable(true).setTimeout(0).build()
-        val data = AdvertiseData.Builder().setIncludeDeviceName(false).addServiceUuid(ParcelUuid(U(0x1812))).build()
+        val data = AdvertiseData.Builder().setIncludeDeviceName(true).addServiceUuid(ParcelUuid(U(0x1812))).build()
         val scan = AdvertiseData.Builder().setIncludeDeviceName(true).build()
         adv.startAdvertising(set, data, scan, advCb)
     }
@@ -158,17 +200,26 @@ class HidRemote(private val ctx: Context) {
     fun start() {
         val a = ad ?: run { status.value = "No Bluetooth"; return }
         if (!a.isEnabled) { status.value = "Turn Bluetooth on first"; return }
-        if (a.bluetoothLeAdvertiser == null) { status.value = "This phone can't act as a BLE peripheral"; return }
-        if (server != null) { advertise(); return }
-        oldName = a.name
+        if (oldName == null) oldName = a.name
         a.name = "RC-525G Phone"
+        startClassic(a)
+        if (a.bluetoothLeAdvertiser == null) { ble = "NOT supported by this phone"; upd(); return }
+        if (server != null) { advertise(); return }
         server = bm.openGattServer(ctx, srv)
         build(); addNext()
+    }
+
+    fun bonded(): List<BluetoothDevice> = ad?.bondedDevices?.toList() ?: emptyList()
+    fun nameOf(d: BluetoothDevice): String = d.name ?: d.address
+    fun connectTo(d: BluetoothDevice) {
+        cls = "connecting to ${nameOf(d)}…"; upd()
+        if (chid?.connect(d) != true) { cls = "connect request failed (is the app registered?)"; upd() }
     }
 
     fun stop() {
         ad?.bluetoothLeAdvertiser?.stopAdvertising(advCb)
         server?.close(); server = null
+        chid?.unregisterApp()
         oldName?.let { ad?.name = it }
     }
 
@@ -177,19 +228,19 @@ class HidRemote(private val ctx: Context) {
         c.setValue(d); server?.notifyCharacteristicChanged(h, c, false)
     }
     fun cons(u: Int) {
-        nfy(con, byteArrayOf(u.toByte(), (u shr 8).toByte()))
-        ui.postDelayed({ nfy(con, ByteArray(2)) }, 40)
+        out(2, con, byteArrayOf(u.toByte(), (u shr 8).toByte()))
+        ui.postDelayed({ out(2, con, ByteArray(2)) }, 40)
     }
     fun key(k: Int, mod: Int = 0) {
-        nfy(kbd, byteArrayOf(mod.toByte(), 0, k.toByte(), 0, 0, 0, 0, 0))
-        ui.postDelayed({ nfy(kbd, ByteArray(8)) }, 40)
+        out(1, kbd, byteArrayOf(mod.toByte(), 0, k.toByte(), 0, 0, 0, 0, 0))
+        ui.postDelayed({ out(1, kbd, ByteArray(8)) }, 40)
     }
     fun type(s: String) {
         Thread {
             for (c in s) {
                 val (k, m) = usage(c) ?: continue
-                nfy(kbd, byteArrayOf(m.toByte(), 0, k.toByte(), 0, 0, 0, 0, 0)); Thread.sleep(35)
-                nfy(kbd, ByteArray(8)); Thread.sleep(35)
+                out(1, kbd, byteArrayOf(m.toByte(), 0, k.toByte(), 0, 0, 0, 0, 0)); Thread.sleep(35)
+                out(1, kbd, ByteArray(8)); Thread.sleep(35)
             }
         }.start()
     }
@@ -237,7 +288,13 @@ class MainActivity : ComponentActivity() {
             RemoteUi(
                 r,
                 onPower = { irPower(this) },
-                onVisible = { r.start() },
+                onVisible = {
+                    r.start()
+                    startActivity(
+                        Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                            .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+                    )
+                },
                 onMic = {
                     mic.launch(
                         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -282,7 +339,18 @@ fun RemoteUi(r: HidRemote, onPower: () -> Unit, onVisible: () -> Unit, onMic: ()
         Arrangement.spacedBy(14.dp), Alignment.CenterHorizontally
     ) {
         Text(r.status.value, color = Color(0xFF9AD), fontSize = 12.sp, textAlign = TextAlign.Center)
-        Button(onClick = onVisible) { Text("Start pairing / reconnect") }
+        var tick by remember { mutableStateOf(0) }
+        val devs = remember(tick) { r.bonded() }
+        Button(onClick = { ctx.startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)) }) {
+            Text("1. Pair TV from phone Bluetooth settings")
+        }
+        Row(row, Arrangement.SpaceEvenly) {
+            OutlinedButton(onClick = { tick++ }) { Text("2. Refresh list") }
+            OutlinedButton(onClick = onVisible) { Text("Make visible") }
+        }
+        devs.forEach { d ->
+            Button(onClick = { r.connectTo(d) }, Modifier.fillMaxWidth()) { Text("3. Connect: ${r.nameOf(d)}") }
+        }
 
         Column(
             Modifier.width(300.dp).clip(RoundedCornerShape(32.dp)).background(Color(0xFF151515)).padding(vertical = 20.dp),

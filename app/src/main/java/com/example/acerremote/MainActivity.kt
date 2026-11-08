@@ -62,6 +62,7 @@ private fun U(x: Int): UUID = UUID.fromString(String.format("%08x-0000-1000-8000
 @SuppressLint("MissingPermission")
 class HidRemote(private val ctx: Context) {
     val status = mutableStateOf("Starting…")
+    val version = mutableStateOf(0)
     private val bm = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val ad: BluetoothAdapter? = bm.adapter
     private var server: BluetoothGattServer? = null
@@ -198,29 +199,40 @@ class HidRemote(private val ctx: Context) {
     }
 
     fun start() {
-        val a = ad ?: run { status.value = "No Bluetooth"; return }
-        if (!a.isEnabled) { status.value = "Turn Bluetooth on first"; return }
-        if (oldName == null) oldName = a.name
-        a.name = "RC-525G Phone"
-        startClassic(a)
-        if (a.bluetoothLeAdvertiser == null) { ble = "NOT supported by this phone"; upd(); return }
-        if (server != null) { advertise(); return }
-        server = bm.openGattServer(ctx, srv)
-        build(); addNext()
+        version.value++
+        try {
+            val a = ad ?: run { status.value = "No Bluetooth"; return }
+            if (!a.isEnabled) { status.value = "Turn Bluetooth on first"; return }
+            if (oldName == null) oldName = a.name
+            a.name = "RC-525G Phone"
+            startClassic(a)
+            if (a.bluetoothLeAdvertiser == null) { ble = "NOT supported by this phone"; upd(); return }
+            if (server != null) { advertise(); return }
+            server = bm.openGattServer(ctx, srv)
+            build(); addNext()
+        } catch (e: Throwable) {
+            status.value = "Error: ${e.javaClass.simpleName}. Allow “Nearby devices” permission, then tap Make visible"
+        }
     }
 
-    fun bonded(): List<BluetoothDevice> = ad?.bondedDevices?.toList() ?: emptyList()
-    fun nameOf(d: BluetoothDevice): String = d.name ?: d.address
+    fun bonded(): List<BluetoothDevice> =
+        try { ad?.bondedDevices?.toList() ?: emptyList() } catch (e: Throwable) { emptyList() }
+    fun nameOf(d: BluetoothDevice): String = try { d.name ?: d.address } catch (e: Throwable) { d.address }
     fun connectTo(d: BluetoothDevice) {
-        cls = "connecting to ${nameOf(d)}…"; upd()
-        if (chid?.connect(d) != true) { cls = "connect request failed (is the app registered?)"; upd() }
+        try {
+            cls = "connecting to ${nameOf(d)}…"; upd()
+            if (chid?.connect(d) != true) { cls = "connect request failed (app not registered?)"; upd() }
+        } catch (e: Throwable) { cls = "error: ${e.javaClass.simpleName}"; upd() }
     }
 
     fun stop() {
-        ad?.bluetoothLeAdvertiser?.stopAdvertising(advCb)
-        server?.close(); server = null
-        chid?.unregisterApp()
-        oldName?.let { ad?.name = it }
+        try {
+            ad?.bluetoothLeAdvertiser?.stopAdvertising(advCb)
+            server?.close(); server = null
+            chid?.unregisterApp()
+            if (classicStarted) ctx.unregisterReceiver(bondRx)
+            oldName?.let { ad?.name = it }
+        } catch (e: Throwable) { }
     }
 
     private fun nfy(c: GC, d: ByteArray) {
@@ -275,6 +287,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        val sp = getSharedPreferences("crash", 0)
+        val lastCrash = sp.getString("c", null)
+        val oldH = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            sp.edit().putString("c", e.stackTraceToString().take(1500)).commit()
+            oldH?.uncaughtException(t, e)
+        }
         r = HidRemote(this)
         val perms = if (Build.VERSION.SDK_INT >= 31)
             arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
@@ -287,6 +306,7 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(Unit) { if (perms.isEmpty()) r.start() else ask.launch(perms) }
             RemoteUi(
                 r,
+                crash = lastCrash,
                 onPower = { irPower(this) },
                 onVisible = {
                     r.start()
@@ -326,7 +346,7 @@ fun Rocker(label: String, up: () -> Unit, down: () -> Unit) = Column(
 }
 
 @Composable
-fun RemoteUi(r: HidRemote, onPower: () -> Unit, onVisible: () -> Unit, onMic: () -> Unit) {
+fun RemoteUi(r: HidRemote, onPower: () -> Unit, onVisible: () -> Unit, onMic: () -> Unit, crash: String? = null) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val vendor = { Toast.makeText(ctx, "Vendor key: not available over standard Bluetooth HID", Toast.LENGTH_SHORT).show() }
     val light = Color(0xFFEDEDE8)
@@ -338,9 +358,10 @@ fun RemoteUi(r: HidRemote, onPower: () -> Unit, onVisible: () -> Unit, onMic: ()
             .statusBarsPadding().padding(16.dp),
         Arrangement.spacedBy(14.dp), Alignment.CenterHorizontally
     ) {
+        crash?.let { Text("Last crash:\n$it", color = Color(0xFFFF8A80), fontSize = 9.sp) }
         Text(r.status.value, color = Color(0xFF9AD), fontSize = 12.sp, textAlign = TextAlign.Center)
         var tick by remember { mutableStateOf(0) }
-        val devs = remember(tick) { r.bonded() }
+        val devs = remember(tick, r.version.value) { r.bonded() }
         Button(onClick = { ctx.startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)) }) {
             Text("1. Pair TV from phone Bluetooth settings")
         }

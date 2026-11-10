@@ -1,11 +1,14 @@
-package com.example.acerremote   // change to your package; minSdk 28, Compose + material3
+package com.example.acerremote
 
-import android.Manifest
-import android.annotation.SuppressLint
-import android.bluetooth.*
 import android.content.*
 import android.hardware.ConsumerIrManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.*
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.speech.RecognizerIntent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -15,8 +18,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -26,243 +27,283 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.*
-import android.bluetooth.BluetoothGattCharacteristic as GC
-import android.bluetooth.BluetoothGattDescriptor as GD
-import android.bluetooth.le.*
-import java.util.UUID
+import java.io.*
+import java.math.BigInteger
+import java.net.Socket
+import java.security.*
+import java.security.cert.X509Certificate
+import java.security.interfaces.RSAPublicKey
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import javax.net.ssl.*
+import javax.security.auth.x500.X500Principal
 
-// ---------- HID report descriptor: keyboard (ID 1) + consumer control (ID 2) ----------
-private val DESC = intArrayOf(
-    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
-    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
-    0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
-    0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
-    0xC0,
-    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x02,
-    0x15, 0x00, 0x26, 0xFF, 0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
-    0xC0
-).map { it.toByte() }.toByteArray()
+// ---------- tiny protobuf helpers ----------
+object Pb {
+    fun varint(v0: Long): ByteArray {
+        var v = v0; val o = ByteArrayOutputStream()
+        while (true) {
+            val b = (v and 0x7F).toInt(); v = v ushr 7
+            if (v == 0L) { o.write(b); break } else o.write(b or 0x80)
+        }
+        return o.toByteArray()
+    }
+    fun int(f: Int, v: Int) = varint((f shl 3).toLong()) + varint(v.toLong())
+    fun bytes(f: Int, b: ByteArray) = varint(((f shl 3) or 2).toLong()) + varint(b.size.toLong()) + b
+    fun str(f: Int, s: String) = bytes(f, s.toByteArray())
+    fun parse(b: ByteArray): Map<Int, Any> {
+        val m = HashMap<Int, Any>(); var p = 0
+        fun rv(): Long {
+            var r = 0L; var s = 0
+            while (p < b.size) {
+                val x = b[p++].toInt() and 0xFF
+                r = r or ((x and 0x7F).toLong() shl s)
+                if ((x and 0x80) == 0) break
+                s += 7
+            }
+            return r
+        }
+        while (p < b.size) {
+            val t = rv().toInt(); val f = t ushr 3
+            when (t and 7) {
+                0 -> { val v = rv(); if (!m.containsKey(f)) m[f] = v }
+                2 -> { val l = rv().toInt(); if (!m.containsKey(f)) m[f] = b.copyOfRange(p, p + l); p += l }
+                1 -> p += 8
+                5 -> p += 4
+                else -> return m
+            }
+        }
+        return m
+    }
+}
+private fun frameWrite(o: OutputStream, b: ByteArray) { o.write(Pb.varint(b.size.toLong())); o.write(b); o.flush() }
+private fun frameRead(i: InputStream): ByteArray {
+    var len = 0; var sh = 0
+    while (true) {
+        val x = i.read(); if (x < 0) throw EOFException("TV closed the connection")
+        len = len or ((x and 0x7F) shl sh)
+        if ((x and 0x80) == 0) break
+        sh += 7
+    }
+    val b = ByteArray(len); var n = 0
+    while (n < len) { val r = i.read(b, n, len - n); if (r < 0) throw EOFException("TV closed the connection"); n += r }
+    return b
+}
+private fun unsignedBytes(b: BigInteger): ByteArray {
+    val a = b.toByteArray()
+    return if (a.size > 1 && a[0] == 0.toByte()) a.copyOfRange(1, a.size) else a
+}
+private fun hexBytes(s: String): ByteArray {
+    val c = s.trim()
+    require(c.length % 2 == 0 && c.isNotEmpty()) { "Code must be 6 characters" }
+    return ByteArray(c.length / 2) { c.substring(2 * it, 2 * it + 2).toInt(16).toByte() }
+}
 
-// Keyboard usages
-private const val K_UP = 0x52; private const val K_DOWN = 0x51
-private const val K_LEFT = 0x50; private const val K_RIGHT = 0x4F
-private const val K_ENTER = 0x28; private const val K_BKSP = 0x2A
-// Consumer usages
-private const val C_BACK = 0x224; private const val C_HOME = 0x223; private const val C_MENU = 0x40
-private const val C_SETTINGS = 0x209; private const val C_MUTE = 0xE2
-private const val C_VOLUP = 0xE9; private const val C_VOLDN = 0xEA
-private const val C_CHUP = 0x9C; private const val C_CHDN = 0x9D
-private const val C_NEXT = 0xB5; private const val C_PREV = 0xB6
-private const val C_GUIDE = 0x8D; private const val C_TV = 0x89
-
-private fun U(x: Int): UUID = UUID.fromString(String.format("%08x-0000-1000-8000-00805f9b34fb", x))
-
-// BLE HID-over-GATT peripheral: advertises exactly like the real remote (HID service 0x1812)
-@SuppressLint("MissingPermission")
-class HidRemote(private val ctx: Context) {
-    val status = mutableStateOf("Starting…")
-    val version = mutableStateOf(0)
-    private val bm = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val ad: BluetoothAdapter? = bm.adapter
-    private var server: BluetoothGattServer? = null
-    private var host: BluetoothDevice? = null
-    private var oldName: String? = null
-    private val pending = ArrayDeque<BluetoothGattService>()
-    private val kbd = GC(U(0x2A4D), GC.PROPERTY_READ or GC.PROPERTY_NOTIFY, GC.PERMISSION_READ_ENCRYPTED)
-    private val con = GC(U(0x2A4D), GC.PROPERTY_READ or GC.PROPERTY_NOTIFY, GC.PERMISSION_READ_ENCRYPTED)
+// ---------- Android TV Remote (Wi-Fi) client: pairing on 6467, control on 6466 ----------
+class Tv(private val ctx: Context) {
+    val status = mutableStateOf("Enter the TV's IP address (or tap Find TV), then tap Pair")
+    val ip = mutableStateOf("")
+    val askCode = mutableStateOf(false)
+    val found = mutableStateListOf<Pair<String, String>>()
+    private val prefs = ctx.getSharedPreferences("tv", 0)
+    private val io = Executors.newSingleThreadExecutor()
     private val ui = Handler(Looper.getMainLooper())
-    private var ble = "starting"
-    private var cls = "starting"
-    private var chid: BluetoothHidDevice? = null
-    private var chost: BluetoothDevice? = null
-    private var classicStarted = false
-    private fun upd() { status.value = "BLE: $ble\nClassic: $cls" }
+    private val codeQ = LinkedBlockingQueue<String>()
+    @Volatile private var sock: SSLSocket? = null
+    @Volatile private var out: OutputStream? = null
+    private var disc: NsdManager.DiscoveryListener? = null
+    private val alias = "tvremote"
 
-    private val ccb = object : BluetoothHidDevice.Callback() {
-        override fun onConnectionStateChanged(d: BluetoothDevice, st: Int) {
-            if (st == BluetoothProfile.STATE_CONNECTED) { chost = d; cls = "connected to ${d.name ?: d.address}"; upd() }
-            else if (d == chost) { chost = null; cls = "disconnected"; upd() }
-        }
+    init { ip.value = prefs.getString("ip", "") ?: "" }
+    fun paired() = prefs.getBoolean("paired", false) && ip.value.isNotBlank()
+    fun connected() = out != null
+
+    // Keep traffic on Wi-Fi even when the router has no internet (phone would otherwise use mobile data).
+    private fun bindWifi() {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        cm.allNetworks.firstOrNull { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+            ?.let { cm.bindProcessToNetwork(it) }
     }
-    private val bondRx = object : BroadcastReceiver() {
-        override fun onReceive(c: Context, i: Intent) {
-            @Suppress("DEPRECATION")
-            val d = i.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
-            if (i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, 0) == BluetoothDevice.BOND_BONDED && host == null) chid?.connect(d)
+
+    private fun ks(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+
+    private fun factory(): SSLSocketFactory {
+        val k = ks()
+        if (!k.containsAlias(alias)) {
+            val spec = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
+                .setKeySize(2048)
+                .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA1, KeyProperties.DIGEST_SHA256,
+                    KeyProperties.DIGEST_SHA384, KeyProperties.DIGEST_SHA512)
+                .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1, KeyProperties.SIGNATURE_PADDING_RSA_PSS)
+                .setCertificateSubject(X500Principal("CN=acer-remote"))
+                .setCertificateSerialNumber(BigInteger.ONE)
+                .build()
+            KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore").apply { initialize(spec) }.generateKeyPair()
         }
+        val km = object : X509KeyManager {
+            override fun getClientAliases(t: String?, i: Array<Principal>?): Array<String> = arrayOf(alias)
+            override fun chooseClientAlias(t: Array<String>?, i: Array<Principal>?, s: Socket?): String = alias
+            override fun getServerAliases(t: String?, i: Array<Principal>?): Array<String>? = null
+            override fun chooseServerAlias(t: String?, i: Array<Principal>?, s: Socket?): String? = null
+            override fun getCertificateChain(a: String?): Array<X509Certificate> =
+                k.getCertificateChain(alias).map { it as X509Certificate }.toTypedArray()
+            override fun getPrivateKey(a: String?): PrivateKey = k.getKey(alias, null) as PrivateKey
+        }
+        // The TV uses a self-signed certificate on your local network, so we accept it.
+        val tm = object : X509TrustManager {
+            override fun checkClientTrusted(c: Array<X509Certificate>?, a: String?) {}
+            override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        }
+        return SSLContext.getInstance("TLSv1.2").apply { init(arrayOf(km), arrayOf(tm), null) }.socketFactory
     }
-    private fun startClassic(a: BluetoothAdapter) {
-        if (classicStarted) return
-        classicStarted = true
-        ctx.registerReceiver(bondRx, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
-        val ok = a.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(p: Int, proxy: BluetoothProfile) {
-                val h = proxy as BluetoothHidDevice
-                chid = h
-                val sdp = BluetoothHidDeviceAppSdpSettings("RC-525G Phone", "Remote Control", "Acer",
-                    BluetoothHidDevice.SUBCLASS1_COMBO, DESC)
-                cls = if (h.registerApp(sdp, null, null, Executors.newSingleThreadExecutor(), ccb)) "registered" else "registerApp FAILED"
-                upd()
+
+    fun discover() {
+        found.clear()
+        try { bindWifi() } catch (e: Exception) {}
+        status.value = "Looking for TVs on Wi-Fi…"
+        val nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
+        try { disc?.let { nsd.stopServiceDiscovery(it) } } catch (e: Exception) {}
+        val l = object : NsdManager.DiscoveryListener {
+            override fun onServiceFound(si: NsdServiceInfo) {
+                try {
+                    nsd.resolveService(si, object : NsdManager.ResolveListener {
+                        override fun onServiceResolved(r: NsdServiceInfo) {
+                            val h = r.host?.hostAddress ?: return
+                            ui.post { if (found.none { it.second == h }) found.add(Pair(r.serviceName, h)) }
+                        }
+                        override fun onResolveFailed(r: NsdServiceInfo, e: Int) {}
+                    })
+                } catch (e: Exception) {}
             }
-            override fun onServiceDisconnected(p: Int) { chid = null }
-        }, BluetoothProfile.HID_DEVICE)
-        if (!ok) { cls = "NOT supported by this phone"; upd() }
-    }
-    private fun out(id: Int, c: GC, d: ByteArray) {
-        nfy(c, d)
-        chost?.let { chid?.sendReport(it, id, d) }
-    }
-
-    private fun ro(u: Int, v: ByteArray, enc: Boolean) =
-        GC(U(u), GC.PROPERTY_READ, if (enc) GC.PERMISSION_READ_ENCRYPTED else GC.PERMISSION_READ).also { it.setValue(v) }
-
-    private fun report(c: GC, id: Int) {
-        c.setValue(ByteArray(if (id == 1) 8 else 2))
-        c.addDescriptor(GD(U(0x2908), GD.PERMISSION_READ_ENCRYPTED).also { it.setValue(byteArrayOf(id.toByte(), 1)) })
-        c.addDescriptor(GD(U(0x2902), GD.PERMISSION_READ_ENCRYPTED or GD.PERMISSION_WRITE_ENCRYPTED))
-    }
-
-    private fun build() {
-        report(kbd, 1); report(con, 2)
-        val prim = BluetoothGattService.SERVICE_TYPE_PRIMARY
-        val dis = BluetoothGattService(U(0x180A), prim).apply {
-            addCharacteristic(ro(0x2A29, "Acer".toByteArray(), false))
-            addCharacteristic(ro(0x2A50, byteArrayOf(0x02, 0x34, 0x12, 0x78, 0x56, 0x01, 0x00), false))
+            override fun onServiceLost(si: NsdServiceInfo) {}
+            override fun onDiscoveryStarted(t: String) {}
+            override fun onDiscoveryStopped(t: String) {}
+            override fun onStartDiscoveryFailed(t: String, e: Int) { status.value = "Auto-find failed. Type the TV's IP address" }
+            override fun onStopDiscoveryFailed(t: String, e: Int) {}
         }
-        val bat = BluetoothGattService(U(0x180F), prim).apply {
-            addCharacteristic(GC(U(0x2A19), GC.PROPERTY_READ or GC.PROPERTY_NOTIFY, GC.PERMISSION_READ).also {
-                it.setValue(byteArrayOf(100))
-                it.addDescriptor(GD(U(0x2902), GD.PERMISSION_READ or GD.PERMISSION_WRITE))
-            })
-        }
-        val hid = BluetoothGattService(U(0x1812), prim).apply {
-            addCharacteristic(ro(0x2A4A, byteArrayOf(0x11, 0x01, 0x00, 0x02), true))
-            addCharacteristic(ro(0x2A4B, DESC, true))
-            addCharacteristic(GC(U(0x2A4C), GC.PROPERTY_WRITE_NO_RESPONSE, GC.PERMISSION_WRITE))
-            addCharacteristic(GC(U(0x2A4E), GC.PROPERTY_READ or GC.PROPERTY_WRITE_NO_RESPONSE,
-                GC.PERMISSION_READ or GC.PERMISSION_WRITE).also { it.setValue(byteArrayOf(1)) })
-            addCharacteristic(kbd); addCharacteristic(con)
-        }
-        pending.addAll(listOf(dis, bat, hid))
+        disc = l
+        try { nsd.discoverServices("_androidtvremote2._tcp", NsdManager.PROTOCOL_DNS_SD, l) }
+        catch (e: Exception) { status.value = "Auto-find failed. Type the TV's IP address" }
     }
 
-    private fun addNext() {
-        val s = pending.removeFirstOrNull()
-        if (s != null) server?.addService(s) else advertise()
-    }
+    fun submit(code: String) { codeQ.offer(code) }
 
-    private val srv = object : BluetoothGattServerCallback() {
-        override fun onServiceAdded(st: Int, service: BluetoothGattService) { addNext() }
-        override fun onConnectionStateChange(d: BluetoothDevice, st: Int, ns: Int) {
-            if (ns == BluetoothProfile.STATE_CONNECTED) {
-                host = d; ble = "connected to ${d.name ?: d.address}"; upd()
-            } else {
-                if (d == host) host = null
-                ble = "disconnected, advertising again"; upd()
-                advertise()
-            }
-        }
-        override fun onCharacteristicReadRequest(d: BluetoothDevice, id: Int, off: Int, c: GC) {
-            val v = c.value ?: ByteArray(0)
-            server?.sendResponse(d, id, BluetoothGatt.GATT_SUCCESS, off, if (off < v.size) v.copyOfRange(off, v.size) else ByteArray(0))
-        }
-        override fun onDescriptorReadRequest(d: BluetoothDevice, id: Int, off: Int, ds: GD) {
-            val v = ds.value ?: ByteArray(2)
-            server?.sendResponse(d, id, BluetoothGatt.GATT_SUCCESS, off, if (off < v.size) v.copyOfRange(off, v.size) else ByteArray(0))
-        }
-        override fun onDescriptorWriteRequest(d: BluetoothDevice, id: Int, ds: GD, prep: Boolean, resp: Boolean, off: Int, v: ByteArray) {
-            ds.setValue(v)
-            if (resp) server?.sendResponse(d, id, BluetoothGatt.GATT_SUCCESS, 0, null)
-        }
-        override fun onCharacteristicWriteRequest(d: BluetoothDevice, id: Int, c: GC, prep: Boolean, resp: Boolean, off: Int, v: ByteArray) {
-            c.setValue(v)
-            if (resp) server?.sendResponse(d, id, BluetoothGatt.GATT_SUCCESS, 0, null)
-        }
-    }
-
-    private val advCb = object : AdvertiseCallback() {
-        override fun onStartSuccess(s: AdvertiseSettings) {
-            if (host == null) { ble = "advertising OK"; upd() }
-        }
-        override fun onStartFailure(e: Int) { if (e != ADVERTISE_FAILED_ALREADY_STARTED) { ble = "advertising FAILED, code $e"; upd() } }
-    }
-
-    private fun advertise() {
-        val adv = ad?.bluetoothLeAdvertiser ?: return
-        adv.stopAdvertising(advCb)
-        val set = AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH).setConnectable(true).setTimeout(0).build()
-        val data = AdvertiseData.Builder().setIncludeDeviceName(true).addServiceUuid(ParcelUuid(U(0x1812))).build()
-        val scan = AdvertiseData.Builder().setIncludeDeviceName(true).build()
-        adv.startAdvertising(set, data, scan, advCb)
-    }
-
-    fun start() {
-        version.value++
-        try {
-            val a = ad ?: run { status.value = "No Bluetooth"; return }
-            if (!a.isEnabled) { status.value = "Turn Bluetooth on first"; return }
-            if (oldName == null) oldName = a.name
-            a.name = "RC-525G Phone"
-            startClassic(a)
-            if (a.bluetoothLeAdvertiser == null) { ble = "NOT supported by this phone"; upd(); return }
-            if (server != null) { advertise(); return }
-            server = bm.openGattServer(ctx, srv)
-            build(); addNext()
-        } catch (e: Throwable) {
-            status.value = "Error: ${e.javaClass.simpleName}. Allow “Nearby devices” permission, then tap Make visible"
-        }
-    }
-
-    fun bonded(): List<BluetoothDevice> =
-        try { ad?.bondedDevices?.toList() ?: emptyList() } catch (e: Throwable) { emptyList() }
-    fun nameOf(d: BluetoothDevice): String = try { d.name ?: d.address } catch (e: Throwable) { d.address }
-    fun connectTo(d: BluetoothDevice) {
-        try {
-            cls = "connecting to ${nameOf(d)}…"; upd()
-            if (chid?.connect(d) != true) { cls = "connect request failed (app not registered?)"; upd() }
-        } catch (e: Throwable) { cls = "error: ${e.javaClass.simpleName}"; upd() }
-    }
-
-    fun stop() {
-        try {
-            ad?.bluetoothLeAdvertiser?.stopAdvertising(advCb)
-            server?.close(); server = null
-            chid?.unregisterApp()
-            if (classicStarted) ctx.unregisterReceiver(bondRx)
-            oldName?.let { ad?.name = it }
-        } catch (e: Throwable) { }
-    }
-
-    private fun nfy(c: GC, d: ByteArray) {
-        val h = host ?: return
-        c.setValue(d); server?.notifyCharacteristicChanged(h, c, false)
-    }
-    fun cons(u: Int) {
-        out(2, con, byteArrayOf(u.toByte(), (u shr 8).toByte()))
-        ui.postDelayed({ out(2, con, ByteArray(2)) }, 40)
-    }
-    fun key(k: Int, mod: Int = 0) {
-        out(1, kbd, byteArrayOf(mod.toByte(), 0, k.toByte(), 0, 0, 0, 0, 0))
-        ui.postDelayed({ out(1, kbd, ByteArray(8)) }, 40)
-    }
-    fun type(s: String) {
+    fun pair() {
+        val host = ip.value.trim()
+        if (host.isEmpty()) { status.value = "Enter the TV's IP address first"; return }
+        disconnect()
         Thread {
-            for (c in s) {
-                val (k, m) = usage(c) ?: continue
-                out(1, kbd, byteArrayOf(m.toByte(), 0, k.toByte(), 0, 0, 0, 0, 0)); Thread.sleep(35)
-                out(1, kbd, ByteArray(8)); Thread.sleep(35)
+            try {
+                bindWifi()
+                status.value = "Pairing: connecting to $host…"
+                val s = factory().createSocket(host, 6467) as SSLSocket
+                s.startHandshake()
+                val i = s.inputStream; val o = s.outputStream
+                fun xchg(f: Int, body: ByteArray): Map<Int, Any> {
+                    frameWrite(o, Pb.int(1, 2) + Pb.int(2, 200) + Pb.bytes(f, body))
+                    val r = Pb.parse(frameRead(i))
+                    if ((r[2] as? Long) != 200L) throw IOException("TV refused (status ${r[2]})")
+                    return r
+                }
+                xchg(10, Pb.str(1, "atvremote") + Pb.str(2, "Acer Remote"))
+                val enc = Pb.int(1, 3) + Pb.int(2, 6)               // hexadecimal, 6 symbols
+                xchg(20, Pb.bytes(1, enc) + Pb.int(3, 1))           // options (we are the input side)
+                xchg(30, Pb.bytes(1, enc) + Pb.int(2, 1))           // configuration
+                status.value = "Type the 6-character code now shown on the TV"
+                askCode.value = true
+                val code = codeQ.take()
+                askCode.value = false
+                val cb = hexBytes(code)
+                val sv = s.session.peerCertificates[0].publicKey as RSAPublicKey
+                val cv = ks().getCertificate(alias).publicKey as RSAPublicKey
+                val md = MessageDigest.getInstance("SHA-256")
+                md.update(unsignedBytes(cv.modulus)); md.update(unsignedBytes(cv.publicExponent))
+                md.update(unsignedBytes(sv.modulus)); md.update(unsignedBytes(sv.publicExponent))
+                md.update(cb.copyOfRange(1, cb.size))
+                val hash = md.digest()
+                if (hash[0] != cb[0]) throw IOException("Wrong code. Tap Pair and try again")
+                xchg(40, Pb.bytes(1, hash))
+                s.close()
+                prefs.edit().putBoolean("paired", true).putString("ip", host).apply()
+                status.value = "Paired! Connecting…"
+                connect()
+            } catch (e: Exception) {
+                askCode.value = false
+                status.value = "Pairing failed: ${e.message ?: e.javaClass.simpleName}"
             }
         }.start()
     }
-    private fun usage(c: Char): Pair<Int, Int>? = when (c) {
-        in 'a'..'z' -> Pair(0x04 + (c - 'a'), 0)
-        in 'A'..'Z' -> Pair(0x04 + (c - 'A'), 2)
-        in '1'..'9' -> Pair(0x1E + (c - '1'), 0)
-        '0' -> Pair(0x27, 0); ' ' -> Pair(0x2C, 0); '.' -> Pair(0x37, 0)
-        ',' -> Pair(0x36, 0); '-' -> Pair(0x2D, 0); '/' -> Pair(0x38, 0); '@' -> Pair(0x1F, 2)
-        else -> null
+
+    fun connect() {
+        val host = ip.value.trim()
+        if (host.isEmpty()) { status.value = "Enter the TV's IP address first"; return }
+        prefs.edit().putString("ip", host).apply()
+        disconnect()
+        Thread {
+            var s: SSLSocket? = null
+            try {
+                bindWifi()
+                status.value = "Connecting to $host…"
+                s = factory().createSocket(host, 6466) as SSLSocket
+                s.startHandshake()
+                sock = s; out = s.outputStream
+                val i = s.inputStream
+                val dev = Pb.str(1, "Phone") + Pb.str(2, "Acer Remote") + Pb.int(3, 1) +
+                    Pb.str(4, "1") + Pb.str(5, "com.example.acerremote") + Pb.str(6, "1.0")
+                while (true) {
+                    val m = Pb.parse(frameRead(i))
+                    when {
+                        m[1] is ByteArray -> send(Pb.bytes(1, Pb.int(1, 622) + Pb.bytes(2, dev)))
+                        m[2] is ByteArray -> { send(Pb.bytes(2, Pb.int(1, 622))); status.value = "Connected to $host" }
+                        m[8] is ByteArray -> {
+                            val v = (Pb.parse(m[8] as ByteArray)[1] as? Long ?: 0L).toInt()
+                            send(Pb.bytes(9, Pb.int(1, v)))
+                        }
+                        m[3] is ByteArray -> status.value = "TV reported an error. Try Pair again"
+                    }
+                }
+            } catch (e: Exception) {
+                if (sock === s) {
+                    out = null; sock = null
+                    status.value = "Not connected (${e.message ?: e.javaClass.simpleName}). Tap Pair if this is the first time"
+                }
+            }
+        }.start()
+    }
+
+    fun disconnect() {
+        val s = sock; sock = null; out = null
+        try { s?.close() } catch (e: Exception) {}
+    }
+    fun close() {
+        disconnect()
+        try { disc?.let { (ctx.getSystemService(Context.NSD_SERVICE) as NsdManager).stopServiceDiscovery(it) } } catch (e: Exception) {}
+    }
+
+    private fun send(b: ByteArray) { synchronized(this) { val o = out ?: return; frameWrite(o, b) } }
+    private fun safe(b: ByteArray) {
+        io.execute {
+            try { if (out == null) status.value = "Not connected. Tap Connect" else send(b) }
+            catch (e: Exception) { status.value = "Send failed: ${e.message}" }
+        }
+    }
+
+    fun key(code: Int) = safe(Pb.bytes(10, Pb.int(1, code) + Pb.int(2, 3)))   // 3 = short press
+    fun app(link: String) = safe(Pb.bytes(90, Pb.str(1, link)))
+
+    fun type(s: String) {
+        io.execute {
+            for (c in s) {
+                val k = when (val l = c.lowercaseChar()) {
+                    in 'a'..'z' -> 29 + (l - 'a')
+                    in '0'..'9' -> 7 + (l - '0')
+                    ' ' -> 62; '.' -> 56; ',' -> 55; '-' -> 69; '/' -> 76; '@' -> 77
+                    else -> -1
+                }
+                if (k >= 0) { try { send(Pb.bytes(10, Pb.int(1, k) + Pb.int(2, 3))) } catch (e: Exception) {}; Thread.sleep(40) }
+            }
+        }
     }
 }
 
@@ -282,8 +323,7 @@ fun irPower(ctx: Context) {
 }
 
 class MainActivity : ComponentActivity() {
-    private lateinit var r: HidRemote
-    override fun onDestroy() { r.stop(); super.onDestroy() }
+    private lateinit var tv: Tv
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -294,27 +334,14 @@ class MainActivity : ComponentActivity() {
             sp.edit().putString("c", e.stackTraceToString().take(1500)).commit()
             oldH?.uncaughtException(t, e)
         }
-        r = HidRemote(this)
-        val perms = if (Build.VERSION.SDK_INT >= 31)
-            arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
-        else arrayOf()
+        tv = Tv(this)
         setContent {
-            val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r.start() }
             val mic = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
-                res.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { r.type(it) }
+                res.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { tv.type(it) }
             }
-            LaunchedEffect(Unit) { if (perms.isEmpty()) r.start() else ask.launch(perms) }
             RemoteUi(
-                r,
-                crash = lastCrash,
+                tv, crash = lastCrash,
                 onPower = { irPower(this) },
-                onVisible = {
-                    r.start()
-                    startActivity(
-                        Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
-                            .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
-                    )
-                },
                 onMic = {
                     mic.launch(
                         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -324,6 +351,8 @@ class MainActivity : ComponentActivity() {
             )
         }
     }
+    override fun onStart() { super.onStart(); if (tv.paired() && !tv.connected()) tv.connect() }
+    override fun onDestroy() { tv.close(); super.onDestroy() }
 }
 
 @Composable
@@ -346,31 +375,34 @@ fun Rocker(label: String, up: () -> Unit, down: () -> Unit) = Column(
 }
 
 @Composable
-fun RemoteUi(r: HidRemote, onPower: () -> Unit, onVisible: () -> Unit, onMic: () -> Unit, crash: String? = null) {
-    val ctx = androidx.compose.ui.platform.LocalContext.current
-    val vendor = { Toast.makeText(ctx, "Vendor key: not available over standard Bluetooth HID", Toast.LENGTH_SHORT).show() }
+fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = null) {
     val light = Color(0xFFEDEDE8)
     val row = Modifier.fillMaxWidth()
     var text by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
 
     Column(
         Modifier.fillMaxSize().background(Color(0xFF0B0B0B)).verticalScroll(rememberScrollState())
             .statusBarsPadding().padding(16.dp),
-        Arrangement.spacedBy(14.dp), Alignment.CenterHorizontally
+        Arrangement.spacedBy(12.dp), Alignment.CenterHorizontally
     ) {
         crash?.let { Text("Last crash:\n$it", color = Color(0xFFFF8A80), fontSize = 9.sp) }
-        Text(r.status.value, color = Color(0xFF9AD), fontSize = 12.sp, textAlign = TextAlign.Center)
-        var tick by remember { mutableStateOf(0) }
-        val devs = remember(tick, r.version.value) { r.bonded() }
-        Button(onClick = { ctx.startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)) }) {
-            Text("1. Pair TV from phone Bluetooth settings")
-        }
+        Text(t.status.value, color = Color(0xFF9AD), fontSize = 12.sp, textAlign = TextAlign.Center)
+        OutlinedTextField(
+            t.ip.value, { t.ip.value = it }, Modifier.fillMaxWidth(), singleLine = true,
+            label = { Text("TV IP address, e.g. 192.168.1.20") }
+        )
         Row(row, Arrangement.SpaceEvenly) {
-            OutlinedButton(onClick = { tick++ }) { Text("2. Refresh list") }
-            OutlinedButton(onClick = onVisible) { Text("Make visible") }
+            OutlinedButton(onClick = { t.discover() }) { Text("Find TV") }
+            OutlinedButton(onClick = { t.pair() }) { Text("Pair") }
+            Button(onClick = { t.connect() }) { Text("Connect") }
         }
-        devs.forEach { d ->
-            Button(onClick = { r.connectTo(d) }, Modifier.fillMaxWidth()) { Text("3. Connect: ${r.nameOf(d)}") }
+        t.found.forEach { (n, h) -> TextButton(onClick = { t.ip.value = h }) { Text("$n  –  $h") } }
+        if (t.askCode.value) {
+            Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
+                OutlinedTextField(code, { code = it.uppercase() }, Modifier.weight(1f), singleLine = true, label = { Text("Code from TV") })
+                Button(onClick = { t.submit(code); code = "" }) { Text("OK") }
+            }
         }
 
         Column(
@@ -379,54 +411,54 @@ fun RemoteUi(r: HidRemote, onPower: () -> Unit, onVisible: () -> Unit, onMic: ()
         ) {
             Row(row, Arrangement.SpaceEvenly) {
                 B("⏻", bg = Color(0xFFC62828), fs = 20, on = onPower)      // IR
-                B("🔇") { r.cons(C_MUTE) }
+                B("🔇") { t.key(164) }
             }
             Row(row, Arrangement.SpaceEvenly) {
-                B("YouTube", 112.dp, bg = light, fg = Color(0xFFD32F2F), fs = 12) { vendor() }
-                B("NETFLIX", 112.dp, bg = light, fg = Color(0xFFD32F2F), fs = 12) { vendor() }
+                B("YouTube", 112.dp, bg = light, fg = Color(0xFFD32F2F), fs = 12) { t.app("https://www.youtube.com") }
+                B("NETFLIX", 112.dp, bg = light, fg = Color(0xFFD32F2F), fs = 12) { t.app("https://www.netflix.com/title") }
             }
             Row(row, Arrangement.SpaceEvenly) {
-                B("prime video", 112.dp, bg = light, fg = Color.Black, fs = 12) { vendor() }
-                B("▦", 112.dp, bg = light, fg = Color.Black, fs = 18) { vendor() }
+                B("prime video", 112.dp, bg = light, fg = Color.Black, fs = 12) { t.app("https://app.primevideo.com") }
+                B("▦", 112.dp, bg = light, fg = Color.Black, fs = 18) { t.key(284) }
             }
             Row(row, Arrangement.SpaceEvenly) {
-                B("👤") { vendor() }
+                B("👤") { t.key(288) }
                 B("🎤", bg = light, fg = Color.Black, on = onMic)
-                B("⚙", fs = 20) { r.cons(C_SETTINGS) }
+                B("⚙", fs = 20) { t.key(176) }
             }
 
             Box(Modifier.size(210.dp).clip(CircleShape).background(light), Alignment.Center) {
-                Box(Modifier.align(Alignment.TopCenter)) { B("▲", 70.dp, 56.dp, Color.Transparent, Color.Black) { r.key(K_UP) } }
-                Box(Modifier.align(Alignment.BottomCenter)) { B("▼", 70.dp, 56.dp, Color.Transparent, Color.Black) { r.key(K_DOWN) } }
-                Box(Modifier.align(Alignment.CenterStart)) { B("◀", 56.dp, 70.dp, Color.Transparent, Color.Black) { r.key(K_LEFT) } }
-                Box(Modifier.align(Alignment.CenterEnd)) { B("▶", 56.dp, 70.dp, Color.Transparent, Color.Black) { r.key(K_RIGHT) } }
-                B("OK", 84.dp, 84.dp, Color(0xFF111111), rad = 42.dp, fs = 18) { r.key(K_ENTER) }
+                Box(Modifier.align(Alignment.TopCenter)) { B("▲", 70.dp, 56.dp, Color.Transparent, Color.Black) { t.key(19) } }
+                Box(Modifier.align(Alignment.BottomCenter)) { B("▼", 70.dp, 56.dp, Color.Transparent, Color.Black) { t.key(20) } }
+                Box(Modifier.align(Alignment.CenterStart)) { B("◀", 56.dp, 70.dp, Color.Transparent, Color.Black) { t.key(21) } }
+                Box(Modifier.align(Alignment.CenterEnd)) { B("▶", 56.dp, 70.dp, Color.Transparent, Color.Black) { t.key(22) } }
+                B("OK", 84.dp, 84.dp, Color(0xFF111111), rad = 42.dp, fs = 18) { t.key(23) }
             }
 
             Row(row, Arrangement.SpaceEvenly) {
-                B("←", fs = 22) { r.cons(C_BACK) }
-                B("⌂", bg = light, fg = Color.Black, fs = 22) { r.cons(C_HOME) }
-                B("📺") { r.cons(C_GUIDE) }
+                B("←", fs = 22) { t.key(4) }
+                B("⌂", bg = light, fg = Color.Black, fs = 22) { t.key(3) }
+                B("📺") { t.key(172) }
             }
             Row(row, Arrangement.SpaceEvenly) {
-                B("⏮") { r.cons(C_PREV) }
-                B("Live TV", 80.dp, 48.dp, Color(0xFF1565C0), fs = 12) { r.cons(C_TV) }
-                B("⏭") { r.cons(C_NEXT) }
+                B("⏮") { t.key(88) }
+                B("Live TV", 80.dp, 48.dp, Color(0xFF1565C0), fs = 12) { t.key(170) }
+                B("⏭") { t.key(87) }
             }
             Row(row, Arrangement.SpaceEvenly, Alignment.CenterVertically) {
-                Rocker("VOL", { r.cons(C_VOLUP) }, { r.cons(C_VOLDN) })
+                Rocker("VOL", { t.key(24) }, { t.key(25) })
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    B("MENU", 76.dp, 40.dp, fs = 11) { r.cons(C_MENU) }
-                    B("SOURCE", 76.dp, 40.dp, fs = 11) { r.cons(C_TV) }
+                    B("MENU", 76.dp, 40.dp, fs = 11) { t.key(82) }
+                    B("SOURCE", 76.dp, 40.dp, fs = 11) { t.key(178) }
                 }
-                Rocker("CH", { r.cons(C_CHUP) }, { r.cons(C_CHDN) })
+                Rocker("CH", { t.key(166) }, { t.key(167) })
             }
         }
 
         Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
             OutlinedTextField(text, { text = it }, Modifier.weight(1f), singleLine = true, placeholder = { Text("Type to TV") })
-            Button(onClick = { r.type(text); text = "" }) { Text("Send") }
-            Button(onClick = { r.key(K_BKSP) }) { Text("⌫") }
+            Button(onClick = { t.type(text); text = "" }) { Text("Send") }
+            Button(onClick = { t.key(67) }) { Text("⌫") }
         }
     }
 }

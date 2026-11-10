@@ -15,6 +15,14 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.input.KeyboardType
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.*
 import androidx.compose.material3.*
@@ -109,6 +117,9 @@ class Tv(private val ctx: Context) {
     val status = mutableStateOf("Enter the TV's IP address (or tap Find TV), then tap Pair")
     val ip = mutableStateOf("")
     val askCode = mutableStateOf(false)
+    val isConnected = mutableStateOf(false)
+    @Volatile private var fg = true
+    private var retry = 0
     val found = mutableStateListOf<Pair<String, String>>()
     private val prefs = ctx.getSharedPreferences("tv", 0)
     private val io = Executors.newSingleThreadExecutor()
@@ -122,6 +133,8 @@ class Tv(private val ctx: Context) {
     init { ip.value = prefs.getString("ip", "") ?: "" }
     fun paired() = prefs.getBoolean("paired", false) && ip.value.isNotBlank()
     fun connected() = out != null
+    fun onStart() { fg = true; retry = 0; if (paired() && !connected()) connect() }
+    fun onStop() { fg = false; disconnect() }   // saves battery; reconnects when you come back
 
     // Keep traffic on Wi-Fi even when the router has no internet (phone would otherwise use mobile data).
     private fun bindWifi() {
@@ -178,12 +191,14 @@ class Tv(private val ctx: Context) {
     // TCP connect with a timeout, then TLS. Gives readable errors instead of hanging.
     private fun open(host: String, port: Int, readTimeout: Int): SSLSocket {
         val plain = Socket()
+        plain.tcpNoDelay = true
         try { plain.connect(InetSocketAddress(host, port), 6000) }
         catch (e: Exception) {
             try { plain.close() } catch (x: Exception) {}
             throw IOException("Can't reach $host:$port (${e.javaClass.simpleName}). Check the IP, that the phone and TV are on the same Wi-Fi, and that the TV is on")
         }
         val s = factory().createSocket(plain, host, port, true) as SSLSocket
+        s.tcpNoDelay = true
         s.soTimeout = 15000
         try { s.startHandshake() }
         catch (e: Exception) {
@@ -298,7 +313,7 @@ class Tv(private val ctx: Context) {
                     val m = Pb.parse(frameRead(i)); hello = true
                     when {
                         m[1] is ByteArray -> send(Pb.bytes(1, Pb.int(1, 622) + Pb.bytes(2, dev)))
-                        m[2] is ByteArray -> { send(Pb.bytes(2, Pb.int(1, 622))); status.value = "Connected to $host" }
+                        m[2] is ByteArray -> { send(Pb.bytes(2, Pb.int(1, 622))); status.value = "Connected to $host"; isConnected.value = true; retry = 0 }
                         m[8] is ByteArray -> {
                             val v = (Pb.parse(m[8] as ByteArray)[1] as? Long ?: 0L).toInt()
                             send(Pb.bytes(9, Pb.int(1, v)))
@@ -308,16 +323,17 @@ class Tv(private val ctx: Context) {
                 }
             } catch (e: Exception) {
                 if (sock === s) {
-                    out = null; sock = null
+                    out = null; sock = null; isConnected.value = false
                     val why = e.message ?: e.javaClass.simpleName
-                    status.value = if (hello) "Connection lost ($why). Tap Connect" else "$why. If this is the first time, tap Pair"
+                    status.value = if (hello) "Connection lost ($why). Reconnecting…" else "$why. If this is the first time, tap Pair"
+                    if (hello && fg && retry++ < 6) ui.postDelayed({ if (fg && !connected()) connect() }, 2500)
                 }
             }
         }.start()
     }
 
     fun disconnect() {
-        val s = sock; sock = null; out = null
+        val s = sock; sock = null; out = null; isConnected.value = false
         try { s?.close() } catch (e: Exception) {}
     }
     fun close() {
@@ -379,11 +395,12 @@ class MainActivity : ComponentActivity() {
             oldH?.uncaughtException(t, e)
         }
         tv = Tv(this)
+        if (tv.ip.value.isBlank()) tv.discover()
         setContent {
             val mic = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
                 res.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { tv.type(it) }
             }
-            RemoteUi(
+            MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF4FC3F7), onPrimary = Color.Black)) { RemoteUi(
                 tv, crash = lastCrash,
                 onPower = { irPower(this) },
                 onMic = {
@@ -392,19 +409,38 @@ class MainActivity : ComponentActivity() {
                             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     )
                 }
-            )
+            ) }
         }
     }
-    override fun onStart() { super.onStart(); if (tv.paired() && !tv.connected()) tv.connect() }
+    override fun onStart() { super.onStart(); tv.onStart() }
+    override fun onStop() { tv.onStop(); super.onStop() }
     override fun onDestroy() { tv.close(); super.onDestroy() }
+}
+
+// Tap with haptic tick; hold to repeat (arrows, volume, channel, delete).
+@Composable
+fun Modifier.press(rep: Boolean = false, on: () -> Unit): Modifier {
+    val scope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+    val cur by rememberUpdatedState(on)
+    return pointerInput(rep) {
+        detectTapGestures(onPress = {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            cur()
+            if (rep) {
+                val job = scope.launch { delay(450); while (true) { cur(); delay(90) } }
+                tryAwaitRelease(); job.cancel()
+            }
+        })
+    }
 }
 
 @Composable
 fun B(
     t: String, w: Dp = 64.dp, h: Dp = 48.dp, bg: Color = Color(0xFF242424), fg: Color = Color.White,
-    rad: Dp = 24.dp, fs: Int = 14, on: () -> Unit
+    rad: Dp = 24.dp, fs: Int = 14, rep: Boolean = false, on: () -> Unit
 ) = Box(
-    Modifier.size(w, h).clip(RoundedCornerShape(rad)).background(bg).clickable(onClick = on),
+    Modifier.size(w, h).clip(RoundedCornerShape(rad)).background(bg).press(rep, on),
     Alignment.Center
 ) { Text(t, color = fg, fontSize = fs.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center) }
 
@@ -413,9 +449,9 @@ fun Rocker(label: String, up: () -> Unit, down: () -> Unit) = Column(
     Modifier.size(64.dp, 150.dp).clip(RoundedCornerShape(32.dp)).background(Color(0xFF242424)),
     Arrangement.Center, Alignment.CenterHorizontally
 ) {
-    Box(Modifier.weight(1f).fillMaxWidth().clickable(onClick = up), Alignment.Center) { Text("+", color = Color.White, fontSize = 22.sp) }
+    Box(Modifier.weight(1f).fillMaxWidth().press(true, up), Alignment.Center) { Text("+", color = Color.White, fontSize = 22.sp) }
     Text(label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-    Box(Modifier.weight(1f).fillMaxWidth().clickable(onClick = down), Alignment.Center) { Text("−", color = Color.White, fontSize = 22.sp) }
+    Box(Modifier.weight(1f).fillMaxWidth().press(true, down), Alignment.Center) { Text("−", color = Color.White, fontSize = 22.sp) }
 }
 
 @Composable
@@ -432,20 +468,25 @@ fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = nul
     ) {
         crash?.let { Text("Last crash:\n$it", color = Color(0xFFFF8A80), fontSize = 9.sp) }
         Text(t.status.value, color = Color(0xFF9AD), fontSize = 12.sp, textAlign = TextAlign.Center)
-        OutlinedTextField(
-            t.ip.value, { t.ip.value = it }, Modifier.fillMaxWidth(), singleLine = true,
-            label = { Text("TV IP address, e.g. 192.168.1.20") }
-        )
-        Row(row, Arrangement.SpaceEvenly) {
-            OutlinedButton(onClick = { t.discover() }) { Text("Find TV") }
-            OutlinedButton(onClick = { t.pair() }) { Text("Pair") }
-            Button(onClick = { t.connect() }) { Text("Connect") }
-        }
-        t.found.forEach { (n, h) -> TextButton(onClick = { t.ip.value = h }) { Text("$n  –  $h") } }
-        if (t.askCode.value) {
-            Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
-                OutlinedTextField(code, { code = it.uppercase() }, Modifier.weight(1f), singleLine = true, label = { Text("Code from TV") })
-                Button(onClick = { t.submit(code); code = "" }) { Text("OK") }
+        if (t.isConnected.value) {
+            TextButton(onClick = { t.disconnect() }) { Text("Change TV") }
+        } else {
+            OutlinedTextField(
+                t.ip.value, { t.ip.value = it.filter { c -> c.isDigit() || c == '.' } }, Modifier.fillMaxWidth(),
+                singleLine = true, label = { Text("TV IP address, e.g. 192.168.1.20") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
+            )
+            Row(row, Arrangement.SpaceEvenly) {
+                OutlinedButton(onClick = { t.discover() }) { Text("Find TV") }
+                OutlinedButton(onClick = { t.pair() }) { Text("Pair") }
+                Button(onClick = { t.connect() }) { Text("Connect") }
+            }
+            t.found.forEach { (n, h) -> TextButton(onClick = { t.ip.value = h }) { Text("$n  –  $h") } }
+            if (t.askCode.value) {
+                Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
+                    OutlinedTextField(code, { code = it.uppercase() }, Modifier.weight(1f), singleLine = true, label = { Text("Code from TV") })
+                    Button(onClick = { t.submit(code); code = "" }) { Text("OK") }
+                }
             }
         }
 
@@ -472,10 +513,10 @@ fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = nul
             }
 
             Box(Modifier.size(210.dp).clip(CircleShape).background(light), Alignment.Center) {
-                Box(Modifier.align(Alignment.TopCenter)) { B("▲", 70.dp, 56.dp, Color.Transparent, Color.Black) { t.key(19) } }
-                Box(Modifier.align(Alignment.BottomCenter)) { B("▼", 70.dp, 56.dp, Color.Transparent, Color.Black) { t.key(20) } }
-                Box(Modifier.align(Alignment.CenterStart)) { B("◀", 56.dp, 70.dp, Color.Transparent, Color.Black) { t.key(21) } }
-                Box(Modifier.align(Alignment.CenterEnd)) { B("▶", 56.dp, 70.dp, Color.Transparent, Color.Black) { t.key(22) } }
+                Box(Modifier.align(Alignment.TopCenter)) { B("▲", 70.dp, 56.dp, Color.Transparent, Color.Black, rep = true) { t.key(19) } }
+                Box(Modifier.align(Alignment.BottomCenter)) { B("▼", 70.dp, 56.dp, Color.Transparent, Color.Black, rep = true) { t.key(20) } }
+                Box(Modifier.align(Alignment.CenterStart)) { B("◀", 56.dp, 70.dp, Color.Transparent, Color.Black, rep = true) { t.key(21) } }
+                Box(Modifier.align(Alignment.CenterEnd)) { B("▶", 56.dp, 70.dp, Color.Transparent, Color.Black, rep = true) { t.key(22) } }
                 B("OK", 84.dp, 84.dp, Color(0xFF111111), rad = 42.dp, fs = 18) { t.key(23) }
             }
 
@@ -502,7 +543,7 @@ fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = nul
         Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
             OutlinedTextField(text, { text = it }, Modifier.weight(1f), singleLine = true, placeholder = { Text("Type to TV") })
             Button(onClick = { t.type(text); text = "" }) { Text("Send") }
-            Button(onClick = { t.key(67) }) { Text("⌫") }
+            B("⌫", 56.dp, 48.dp, rep = true) { t.key(67) }
         }
     }
 }

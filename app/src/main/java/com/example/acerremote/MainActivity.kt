@@ -7,8 +7,7 @@ import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.*
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
+import android.util.Base64
 import android.speech.RecognizerIntent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -36,7 +35,13 @@ import java.security.interfaces.RSAPublicKey
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import javax.net.ssl.*
-import javax.security.auth.x500.X500Principal
+import java.net.InetSocketAddress
+import java.security.spec.PKCS8EncodedKeySpec
+import java.util.Date
+import org.bouncycastle.asn1.x500.X500Name
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 
 // ---------- tiny protobuf helpers ----------
 object Pb {
@@ -112,7 +117,7 @@ class Tv(private val ctx: Context) {
     @Volatile private var sock: SSLSocket? = null
     @Volatile private var out: OutputStream? = null
     private var disc: NsdManager.DiscoveryListener? = null
-    private val alias = "tvremote"
+    private var ident: Pair<PrivateKey, X509Certificate>? = null
 
     init { ip.value = prefs.getString("ip", "") ?: "" }
     fun paired() = prefs.getBoolean("paired", false) && ip.value.isNotBlank()
@@ -120,34 +125,46 @@ class Tv(private val ctx: Context) {
 
     // Keep traffic on Wi-Fi even when the router has no internet (phone would otherwise use mobile data).
     private fun bindWifi() {
-        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        cm.allNetworks.firstOrNull { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
-            ?.let { cm.bindProcessToNetwork(it) }
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.allNetworks.firstOrNull { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+                ?.let { cm.bindProcessToNetwork(it) }
+        } catch (e: Exception) {}
     }
 
-    private fun ks(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    // Our own client identity (software RSA key + self-signed certificate), saved on the phone.
+    private fun identity(): Pair<PrivateKey, X509Certificate> {
+        ident?.let { return it }
+        val ks = prefs.getString("key2", null); val cs = prefs.getString("cert2", null)
+        if (ks != null && cs != null) {
+            try {
+                val pk = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(Base64.decode(ks, Base64.DEFAULT)))
+                val c = java.security.cert.CertificateFactory.getInstance("X.509")
+                    .generateCertificate(ByteArrayInputStream(Base64.decode(cs, Base64.DEFAULT))) as X509Certificate
+                return Pair(pk, c).also { ident = it }
+            } catch (e: Exception) {}
+        }
+        val kp = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val n = X500Name("CN=acer-remote")
+        val from = Date(System.currentTimeMillis() - 86_400_000L)
+        val to = Date(System.currentTimeMillis() + 3650L * 86_400_000L)
+        val holder = JcaX509v3CertificateBuilder(n, BigInteger.valueOf(System.currentTimeMillis()), from, to, n, kp.public)
+            .build(JcaContentSignerBuilder("SHA256withRSA").build(kp.private))
+        val c = JcaX509CertificateConverter().getCertificate(holder)
+        prefs.edit().putString("key2", Base64.encodeToString(kp.private.encoded, Base64.DEFAULT))
+            .putString("cert2", Base64.encodeToString(c.encoded, Base64.DEFAULT)).putBoolean("paired", false).apply()
+        return Pair(kp.private, c).also { ident = it }
+    }
 
     private fun factory(): SSLSocketFactory {
-        val k = ks()
-        if (!k.containsAlias(alias)) {
-            val spec = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
-                .setKeySize(2048)
-                .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA1, KeyProperties.DIGEST_SHA256,
-                    KeyProperties.DIGEST_SHA384, KeyProperties.DIGEST_SHA512)
-                .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1, KeyProperties.SIGNATURE_PADDING_RSA_PSS)
-                .setCertificateSubject(X500Principal("CN=acer-remote"))
-                .setCertificateSerialNumber(BigInteger.ONE)
-                .build()
-            KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore").apply { initialize(spec) }.generateKeyPair()
-        }
+        val (pk, cert) = identity()
         val km = object : X509KeyManager {
-            override fun getClientAliases(t: String?, i: Array<Principal>?): Array<String> = arrayOf(alias)
-            override fun chooseClientAlias(t: Array<String>?, i: Array<Principal>?, s: Socket?): String = alias
+            override fun getClientAliases(t: String?, i: Array<Principal>?): Array<String> = arrayOf("c")
+            override fun chooseClientAlias(t: Array<String>?, i: Array<Principal>?, s: Socket?): String = "c"
             override fun getServerAliases(t: String?, i: Array<Principal>?): Array<String>? = null
             override fun chooseServerAlias(t: String?, i: Array<Principal>?, s: Socket?): String? = null
-            override fun getCertificateChain(a: String?): Array<X509Certificate> =
-                k.getCertificateChain(alias).map { it as X509Certificate }.toTypedArray()
-            override fun getPrivateKey(a: String?): PrivateKey = k.getKey(alias, null) as PrivateKey
+            override fun getCertificateChain(a: String?): Array<X509Certificate> = arrayOf(cert)
+            override fun getPrivateKey(a: String?): PrivateKey = pk
         }
         // The TV uses a self-signed certificate on your local network, so we accept it.
         val tm = object : X509TrustManager {
@@ -155,7 +172,26 @@ class Tv(private val ctx: Context) {
             override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {}
             override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
         }
-        return SSLContext.getInstance("TLSv1.2").apply { init(arrayOf(km), arrayOf(tm), null) }.socketFactory
+        return SSLContext.getInstance("TLS").apply { init(arrayOf(km), arrayOf(tm), null) }.socketFactory
+    }
+
+    // TCP connect with a timeout, then TLS. Gives readable errors instead of hanging.
+    private fun open(host: String, port: Int, readTimeout: Int): SSLSocket {
+        val plain = Socket()
+        try { plain.connect(InetSocketAddress(host, port), 6000) }
+        catch (e: Exception) {
+            try { plain.close() } catch (x: Exception) {}
+            throw IOException("Can't reach $host:$port (${e.javaClass.simpleName}). Check the IP, that the phone and TV are on the same Wi-Fi, and that the TV is on")
+        }
+        val s = factory().createSocket(plain, host, port, true) as SSLSocket
+        s.soTimeout = 15000
+        try { s.startHandshake() }
+        catch (e: Exception) {
+            try { s.close() } catch (x: Exception) {}
+            throw IOException("Secure connection failed (${e.javaClass.simpleName}: ${e.message})")
+        }
+        s.soTimeout = readTimeout
+        return s
     }
 
     fun discover() {
@@ -192,13 +228,13 @@ class Tv(private val ctx: Context) {
     fun pair() {
         val host = ip.value.trim()
         if (host.isEmpty()) { status.value = "Enter the TV's IP address first"; return }
-        disconnect()
+        disconnect(); codeQ.clear()
         Thread {
+            var stage = "starting"
             try {
                 bindWifi()
-                status.value = "Pairing: connecting to $host…"
-                val s = factory().createSocket(host, 6467) as SSLSocket
-                s.startHandshake()
+                stage = "connecting to $host:6467"; status.value = "Pairing: $stage…"
+                val s = open(host, 6467, 0)
                 val i = s.inputStream; val o = s.outputStream
                 fun xchg(f: Int, body: ByteArray): Map<Int, Any> {
                     frameWrite(o, Pb.int(1, 2) + Pb.int(2, 200) + Pb.bytes(f, body))
@@ -206,31 +242,38 @@ class Tv(private val ctx: Context) {
                     if ((r[2] as? Long) != 200L) throw IOException("TV refused (status ${r[2]})")
                     return r
                 }
-                xchg(10, Pb.str(1, "atvremote") + Pb.str(2, "Acer Remote"))
                 val enc = Pb.int(1, 3) + Pb.int(2, 6)               // hexadecimal, 6 symbols
-                xchg(20, Pb.bytes(1, enc) + Pb.int(3, 1))           // options (we are the input side)
-                xchg(30, Pb.bytes(1, enc) + Pb.int(2, 1))           // configuration
+                stage = "pairing request (1/3)"; status.value = "Pairing: $stage…"
+                xchg(10, Pb.str(1, "atvremote") + Pb.str(2, "Acer Remote"))
+                stage = "options (2/3)"; status.value = "Pairing: $stage…"
+                xchg(20, Pb.bytes(1, enc) + Pb.int(3, 1))           // we are the input side
+                stage = "configuration (3/3)"; status.value = "Pairing: $stage…"
+                xchg(30, Pb.bytes(1, enc) + Pb.int(2, 1))
+                stage = "waiting for the code"
                 status.value = "Type the 6-character code now shown on the TV"
                 askCode.value = true
                 val code = codeQ.take()
                 askCode.value = false
+                stage = "checking the code"
                 val cb = hexBytes(code)
                 val sv = s.session.peerCertificates[0].publicKey as RSAPublicKey
-                val cv = ks().getCertificate(alias).publicKey as RSAPublicKey
+                val cv = identity().second.publicKey as RSAPublicKey
                 val md = MessageDigest.getInstance("SHA-256")
                 md.update(unsignedBytes(cv.modulus)); md.update(unsignedBytes(cv.publicExponent))
                 md.update(unsignedBytes(sv.modulus)); md.update(unsignedBytes(sv.publicExponent))
                 md.update(cb.copyOfRange(1, cb.size))
                 val hash = md.digest()
                 if (hash[0] != cb[0]) throw IOException("Wrong code. Tap Pair and try again")
+                stage = "sending the secret"
                 xchg(40, Pb.bytes(1, hash))
-                s.close()
+                try { s.close() } catch (e: Exception) {}
                 prefs.edit().putBoolean("paired", true).putString("ip", host).apply()
                 status.value = "Paired! Connecting…"
+                Thread.sleep(600)
                 connect()
             } catch (e: Exception) {
                 askCode.value = false
-                status.value = "Pairing failed: ${e.message ?: e.javaClass.simpleName}"
+                status.value = "Pairing failed at $stage: ${e.message ?: e.javaClass.simpleName}"
             }
         }.start()
     }
@@ -242,17 +285,17 @@ class Tv(private val ctx: Context) {
         disconnect()
         Thread {
             var s: SSLSocket? = null
+            var hello = false
             try {
                 bindWifi()
-                status.value = "Connecting to $host…"
-                s = factory().createSocket(host, 6466) as SSLSocket
-                s.startHandshake()
+                status.value = "Connecting to $host:6466…"
+                s = open(host, 6466, 40000)
                 sock = s; out = s.outputStream
                 val i = s.inputStream
                 val dev = Pb.str(1, "Phone") + Pb.str(2, "Acer Remote") + Pb.int(3, 1) +
                     Pb.str(4, "1") + Pb.str(5, "com.example.acerremote") + Pb.str(6, "1.0")
                 while (true) {
-                    val m = Pb.parse(frameRead(i))
+                    val m = Pb.parse(frameRead(i)); hello = true
                     when {
                         m[1] is ByteArray -> send(Pb.bytes(1, Pb.int(1, 622) + Pb.bytes(2, dev)))
                         m[2] is ByteArray -> { send(Pb.bytes(2, Pb.int(1, 622))); status.value = "Connected to $host" }
@@ -266,7 +309,8 @@ class Tv(private val ctx: Context) {
             } catch (e: Exception) {
                 if (sock === s) {
                     out = null; sock = null
-                    status.value = "Not connected (${e.message ?: e.javaClass.simpleName}). Tap Pair if this is the first time"
+                    val why = e.message ?: e.javaClass.simpleName
+                    status.value = if (hello) "Connection lost ($why). Tap Connect" else "$why. If this is the first time, tap Pair"
                 }
             }
         }.start()

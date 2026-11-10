@@ -20,6 +20,7 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     lint { abortOnError = false }
+    packaging { resources { excludes += setOf("META-INF/versions/**", "META-INF/DEPENDENCIES", "META-INF/{AL2.0,LGPL2.1}") } }
 }
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))
@@ -28,4 +29,5 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 }

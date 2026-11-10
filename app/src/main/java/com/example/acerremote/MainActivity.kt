@@ -120,12 +120,14 @@ private fun hexBytes(s: String): ByteArray {
 
 // ---------- Android TV Remote (Wi-Fi) client: pairing on 6467, control on 6466 ----------
 class Tv(private val ctx: Context) {
-    val status = mutableStateOf("Enter the TV's IP address (or tap Find TV), then tap Pair")
+    val status = mutableStateOf("Searching for TVs on your Wi-Fi…")
     val ip = mutableStateOf("")
     val askCode = mutableStateOf(false)
     val isConnected = mutableStateOf(false)
     @Volatile private var fg = true
     private var retry = 0
+    @Volatile private var connecting = false
+    @Volatile private var pairing = false
     val kbdReq = mutableStateOf(0)                 // bumps when the TV asks for the phone keyboard
     @Volatile private var imeSeen = false
     @Volatile private var imeCounter = 1
@@ -143,8 +145,9 @@ class Tv(private val ctx: Context) {
     init { ip.value = prefs.getString("ip", "") ?: "" }
     fun paired() = prefs.getBoolean("paired", false) && ip.value.isNotBlank()
     fun connected() = out != null
-    fun onStart() { fg = true; retry = 0; if (paired() && !connected()) connect() }
-    fun onStop() { fg = false; disconnect() }   // saves battery; reconnects when you come back
+    fun onStart() { fg = true; startDiscovery(); if (paired() && !connected() && !connecting && !pairing) connect() }
+    fun onStop() { fg = false }
+    private fun tvLabel() = prefs.getString("name", null) ?: ip.value
 
     // Keep traffic on Wi-Fi even when the router has no internet (phone would otherwise use mobile data).
     private fun bindWifi() {
@@ -199,10 +202,10 @@ class Tv(private val ctx: Context) {
     }
 
     // TCP connect with a timeout, then TLS. Gives readable errors instead of hanging.
-    private fun open(host: String, port: Int, readTimeout: Int): SSLSocket {
+    private fun open(host: String, port: Int, readTimeout: Int, connTimeout: Int = 6000): SSLSocket {
         val plain = Socket()
         plain.tcpNoDelay = true
-        try { plain.connect(InetSocketAddress(host, port), 6000) }
+        try { plain.connect(InetSocketAddress(host, port), connTimeout) }
         catch (e: Exception) {
             try { plain.close() } catch (x: Exception) {}
             throw IOException("Can't reach $host:$port (${e.javaClass.simpleName}). Check the IP, that the phone and TV are on the same Wi-Fi, and that the TV is on")
@@ -219,33 +222,67 @@ class Tv(private val ctx: Context) {
         return s
     }
 
-    fun discover() {
-        found.clear()
+    private val nsd by lazy { ctx.getSystemService(Context.NSD_SERVICE) as NsdManager }
+
+    fun startDiscovery() {
+        if (disc != null) return
         try { bindWifi() } catch (e: Exception) {}
-        status.value = "Looking for TVs on Wi-Fi…"
-        val nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
-        try { disc?.let { nsd.stopServiceDiscovery(it) } } catch (e: Exception) {}
         val l = object : NsdManager.DiscoveryListener {
-            override fun onServiceFound(si: NsdServiceInfo) {
-                try {
-                    nsd.resolveService(si, object : NsdManager.ResolveListener {
-                        override fun onServiceResolved(r: NsdServiceInfo) {
-                            val h = r.host?.hostAddress ?: return
-                            ui.post { if (found.none { it.second == h }) found.add(Pair(r.serviceName, h)) }
-                        }
-                        override fun onResolveFailed(r: NsdServiceInfo, e: Int) {}
-                    })
-                } catch (e: Exception) {}
-            }
+            override fun onServiceFound(si: NsdServiceInfo) { resolve(si) }
             override fun onServiceLost(si: NsdServiceInfo) {}
             override fun onDiscoveryStarted(t: String) {}
             override fun onDiscoveryStopped(t: String) {}
-            override fun onStartDiscoveryFailed(t: String, e: Int) { status.value = "Auto-find failed. Type the TV's IP address" }
+            override fun onStartDiscoveryFailed(t: String, e: Int) { disc = null }
             override fun onStopDiscoveryFailed(t: String, e: Int) {}
         }
         disc = l
-        try { nsd.discoverServices("_androidtvremote2._tcp", NsdManager.PROTOCOL_DNS_SD, l) }
-        catch (e: Exception) { status.value = "Auto-find failed. Type the TV's IP address" }
+        try { nsd.discoverServices("_androidtvremote2._tcp", NsdManager.PROTOCOL_DNS_SD, l) } catch (e: Exception) { disc = null }
+    }
+
+    private fun stopDiscovery() {
+        try { disc?.let { nsd.stopServiceDiscovery(it) } } catch (e: Exception) {}
+        disc = null
+    }
+
+    fun discover() { stopDiscovery(); found.clear(); startDiscovery() }   // "Search again"
+
+    private fun resolve(si: NsdServiceInfo) {
+        try {
+            nsd.resolveService(si, object : NsdManager.ResolveListener {
+                override fun onServiceResolved(r: NsdServiceInfo) {
+                    val h = r.host?.hostAddress ?: return
+                    val v4 = r.host is java.net.Inet4Address
+                    ui.post { gotTv(r.serviceName, h, v4) }
+                }
+                override fun onResolveFailed(r: NsdServiceInfo, e: Int) {
+                    if (e == NsdManager.FAILURE_ALREADY_ACTIVE) ui.postDelayed({ resolve(si) }, 600)
+                }
+            })
+        } catch (e: Exception) {}
+    }
+
+    private fun gotTv(name: String, host: String, v4: Boolean) {
+        val i = found.indexOfFirst { it.first == name }
+        if (i >= 0 && !v4) return
+        if (i >= 0) found[i] = Pair(name, host) else found.add(Pair(name, host))
+        if (v4 && name == prefs.getString("name", null)) {          // our TV is (back) online, maybe with a new IP
+            if (ip.value != host) { ip.value = host; prefs.edit().putString("ip", host).apply() }
+            if (fg && paired() && !connected() && !connecting && !pairing) connect()
+        }
+    }
+
+    fun pairWith(name: String, host: String) {
+        if (host.isBlank()) return
+        ip.value = host
+        prefs.edit().putString("name", name.ifBlank { null }).putString("ip", host).apply()
+        pair()
+    }
+
+    fun changeTv() {
+        prefs.edit().putBoolean("paired", false).apply()
+        disconnect()
+        status.value = "Pick your TV from the list"
+        startDiscovery()
     }
 
     fun submit(code: String) { codeQ.offer(code) }
@@ -253,7 +290,7 @@ class Tv(private val ctx: Context) {
     fun pair() {
         val host = ip.value.trim()
         if (host.isEmpty()) { status.value = "Enter the TV's IP address first"; return }
-        disconnect(); codeQ.clear()
+        pairing = true; disconnect(); codeQ.clear()
         Thread {
             var stage = "starting"
             try {
@@ -295,9 +332,10 @@ class Tv(private val ctx: Context) {
                 prefs.edit().putBoolean("paired", true).putString("ip", host).apply()
                 status.value = "Paired! Connecting…"
                 Thread.sleep(600)
+                pairing = false
                 connect()
             } catch (e: Exception) {
-                askCode.value = false
+                askCode.value = false; pairing = false
                 status.value = "Pairing failed at $stage: ${e.message ?: e.javaClass.simpleName}"
             }
         }.start()
@@ -306,15 +344,18 @@ class Tv(private val ctx: Context) {
     fun connect() {
         val host = ip.value.trim()
         if (host.isEmpty()) { status.value = "Enter the TV's IP address first"; return }
+        if (connecting) return
         prefs.edit().putString("ip", host).apply()
         disconnect()
+        connecting = true
         Thread {
             var s: SSLSocket? = null
             var hello = false
+            var retryWanted = false
             try {
                 bindWifi()
-                status.value = "Connecting to $host:6466…"
-                s = open(host, 6466, 40000)
+                status.value = "Connecting to ${tvLabel()}…"
+                s = open(host, 6466, 40000, 3000)
                 sock = s; out = s.outputStream
                 val i = s.inputStream
                 val dev = Pb.str(1, "Phone") + Pb.str(2, "Acer Remote") + Pb.int(3, 1) +
@@ -323,7 +364,7 @@ class Tv(private val ctx: Context) {
                     val m = Pb.parse(frameRead(i)); hello = true
                     when {
                         m[1] is ByteArray -> send(Pb.bytes(1, Pb.int(1, 622) + Pb.bytes(2, dev)))
-                        m[2] is ByteArray -> { send(Pb.bytes(2, Pb.int(1, 622))); status.value = "Connected to $host"; isConnected.value = true; retry = 0 }
+                        m[2] is ByteArray -> { send(Pb.bytes(2, Pb.int(1, 622))); status.value = "Connected to ${tvLabel()}"; isConnected.value = true; retry = 0 }
                         m[8] is ByteArray -> {
                             val v = (Pb.parse(m[8] as ByteArray)[1] as? Long ?: 0L).toInt()
                             send(Pb.bytes(9, Pb.int(1, v)))
@@ -344,12 +385,16 @@ class Tv(private val ctx: Context) {
                     }
                 }
             } catch (e: Exception) {
-                if (sock === s) {
-                    out = null; sock = null; isConnected.value = false
-                    val why = e.message ?: e.javaClass.simpleName
-                    status.value = if (hello) "Connection lost ($why). Reconnecting…" else "$why. If this is the first time, tap Pair"
-                    if (hello && fg && retry++ < 6) ui.postDelayed({ if (fg && !connected()) connect() }, 2500)
+                if (sock === s) {                      // dropped by itself (TV turned off, Wi-Fi blip…)
+                    out = null; sock = null; isConnected.value = false; imeSeen = false
+                    status.value = if (paired()) "${tvLabel()} is off or not reachable. It will reconnect by itself…"
+                                   else (e.message ?: e.javaClass.simpleName)
+                    retryWanted = true
                 }
+            } finally {
+                connecting = false
+                if (retryWanted && fg && paired() && !pairing)
+                    ui.postDelayed({ if (fg && !connected() && !connecting && !pairing && paired()) connect() }, 3000)
             }
         }.start()
     }
@@ -360,7 +405,7 @@ class Tv(private val ctx: Context) {
     }
     fun close() {
         disconnect()
-        try { disc?.let { (ctx.getSystemService(Context.NSD_SERVICE) as NsdManager).stopServiceDiscovery(it) } } catch (e: Exception) {}
+        stopDiscovery()
     }
 
     private fun send(b: ByteArray) { synchronized(this) { val o = out ?: return; frameWrite(o, b) } }
@@ -411,7 +456,6 @@ class MainActivity : ComponentActivity() {
             oldH?.uncaughtException(t, e)
         }
         tv = Tv(this)
-        if (tv.ip.value.isBlank()) tv.discover()
         setContent {
             val mic = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
                 res.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { tv.type(it) }
@@ -477,6 +521,7 @@ fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = nul
     val row = Modifier.fillMaxWidth()
     var text by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
+    var manual by remember { mutableStateOf(false) }
     val focus = remember { FocusRequester() }
     val kbd = LocalSoftwareKeyboardController.current
     LaunchedEffect(t.kbdReq.value) {
@@ -491,23 +536,33 @@ fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = nul
         crash?.let { Text("Last crash:\n$it", color = Color(0xFFFF8A80), fontSize = 9.sp) }
         Text(t.status.value, color = Color(0xFF9AD), fontSize = 12.sp, textAlign = TextAlign.Center)
         if (t.isConnected.value) {
-            TextButton(onClick = { t.disconnect() }) { Text("Change TV") }
+            TextButton(onClick = { t.changeTv() }) { Text("Change TV") }
         } else {
-            OutlinedTextField(
-                t.ip.value, { t.ip.value = it.filter { c -> c.isDigit() || c == '.' } }, Modifier.fillMaxWidth(),
-                singleLine = true, label = { Text("TV IP address, e.g. 192.168.1.20") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
-            )
-            Row(row, Arrangement.SpaceEvenly) {
-                OutlinedButton(onClick = { t.discover() }) { Text("Find TV") }
-                OutlinedButton(onClick = { t.pair() }) { Text("Pair") }
-                Button(onClick = { t.connect() }) { Text("Connect") }
+            Text("TVs on your Wi-Fi. Tap yours:", color = Color(0xFFB0BEC5), fontSize = 12.sp)
+            t.found.forEach { (n, h) ->
+                Button(onClick = { t.pairWith(n, h) }, Modifier.fillMaxWidth()) { Text(n) }
             }
-            t.found.forEach { (n, h) -> TextButton(onClick = { t.ip.value = h }) { Text("$n  –  $h") } }
+            if (t.found.isEmpty()) {
+                Text("Searching… the TV must be on and on the same Wi-Fi", color = Color(0xFF78909C), fontSize = 12.sp, textAlign = TextAlign.Center)
+            }
             if (t.askCode.value) {
                 Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
-                    OutlinedTextField(code, { code = it.uppercase() }, Modifier.weight(1f), singleLine = true, label = { Text("Code from TV") })
+                    OutlinedTextField(code, { code = it.uppercase() }, Modifier.weight(1f), singleLine = true, label = { Text("Code shown on TV") })
                     Button(onClick = { t.submit(code); code = "" }) { Text("OK") }
+                }
+            }
+            Row(row, Arrangement.SpaceEvenly) {
+                OutlinedButton(onClick = { t.discover() }) { Text("Search again") }
+                TextButton(onClick = { manual = !manual }) { Text("TV not listed?") }
+            }
+            if (manual) {
+                Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        t.ip.value, { t.ip.value = it.filter { c -> c.isDigit() || c == '.' } }, Modifier.weight(1f),
+                        singleLine = true, label = { Text("TV IP address") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
+                    )
+                    Button(onClick = { t.pairWith("", t.ip.value.trim()) }) { Text("Pair") }
                 }
             }
         }

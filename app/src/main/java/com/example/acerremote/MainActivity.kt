@@ -16,7 +16,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -120,6 +126,10 @@ class Tv(private val ctx: Context) {
     val isConnected = mutableStateOf(false)
     @Volatile private var fg = true
     private var retry = 0
+    val kbdReq = mutableStateOf(0)                 // bumps when the TV asks for the phone keyboard
+    @Volatile private var imeSeen = false
+    @Volatile private var imeCounter = 1
+    @Volatile private var fieldCounter = 1
     val found = mutableStateListOf<Pair<String, String>>()
     private val prefs = ctx.getSharedPreferences("tv", 0)
     private val io = Executors.newSingleThreadExecutor()
@@ -318,6 +328,18 @@ class Tv(private val ctx: Context) {
                             val v = (Pb.parse(m[8] as ByteArray)[1] as? Long ?: 0L).toInt()
                             send(Pb.bytes(9, Pb.int(1, v)))
                         }
+                        m[20] is ByteArray -> {                       // TV: a text box got focus
+                            val p = Pb.parse(m[20] as ByteArray)
+                            (p[1] as? ByteArray)?.let { a -> (Pb.parse(a)[1] as? Long)?.let { imeCounter = it.toInt() } }
+                            (p[2] as? ByteArray)?.let { t -> (Pb.parse(t)[1] as? Long)?.let { fieldCounter = it.toInt() } }
+                            imeSeen = true
+                        }
+                        m[22] is ByteArray -> {                       // TV: please show the keyboard
+                            val p = Pb.parse(m[22] as ByteArray)
+                            (p[2] as? ByteArray)?.let { t -> (Pb.parse(t)[1] as? Long)?.let { fieldCounter = it.toInt() } }
+                            imeSeen = true
+                            ui.post { kbdReq.value++ }
+                        }
                         m[3] is ByteArray -> status.value = "TV reported an error. Try Pair again"
                     }
                 }
@@ -333,7 +355,7 @@ class Tv(private val ctx: Context) {
     }
 
     fun disconnect() {
-        val s = sock; sock = null; out = null; isConnected.value = false
+        val s = sock; sock = null; out = null; isConnected.value = false; imeSeen = false
         try { s?.close() } catch (e: Exception) {}
     }
     fun close() {
@@ -352,18 +374,12 @@ class Tv(private val ctx: Context) {
     fun key(code: Int) = safe(Pb.bytes(10, Pb.int(1, code) + Pb.int(2, 3)))   // 3 = short press
     fun app(link: String) = safe(Pb.bytes(90, Pb.str(1, link)))
 
+    // Android TV ignores letter key presses; text must go through its text-input channel.
     fun type(s: String) {
-        io.execute {
-            for (c in s) {
-                val k = when (val l = c.lowercaseChar()) {
-                    in 'a'..'z' -> 29 + (l - 'a')
-                    in '0'..'9' -> 7 + (l - '0')
-                    ' ' -> 62; '.' -> 56; ',' -> 55; '-' -> 69; '/' -> 76; '@' -> 77
-                    else -> -1
-                }
-                if (k >= 0) { try { send(Pb.bytes(10, Pb.int(1, k) + Pb.int(2, 3))) } catch (e: Exception) {}; Thread.sleep(40) }
-            }
-        }
+        if (s.isEmpty()) return
+        if (!imeSeen) { status.value = "On the TV, select a search box first, then type again"; return }
+        val info = Pb.int(1, 1) + Pb.bytes(2, Pb.int(1, s.length) + Pb.int(2, s.length) + Pb.str(3, s))
+        safe(Pb.bytes(21, Pb.int(1, imeCounter) + Pb.int(2, fieldCounter) + Pb.bytes(3, info)))
     }
 }
 
@@ -454,12 +470,18 @@ fun Rocker(label: String, up: () -> Unit, down: () -> Unit) = Column(
     Box(Modifier.weight(1f).fillMaxWidth().press(true, down), Alignment.Center) { Text("−", color = Color.White, fontSize = 22.sp) }
 }
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = null) {
     val light = Color(0xFFEDEDE8)
     val row = Modifier.fillMaxWidth()
     var text by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
+    val focus = remember { FocusRequester() }
+    val kbd = LocalSoftwareKeyboardController.current
+    LaunchedEffect(t.kbdReq.value) {
+        if (t.kbdReq.value > 0) { try { focus.requestFocus(); kbd?.show() } catch (e: Exception) {} }
+    }
 
     Column(
         Modifier.fillMaxSize().background(Color(0xFF0B0B0B)).verticalScroll(rememberScrollState())
@@ -540,10 +562,16 @@ fun RemoteUi(t: Tv, onPower: () -> Unit, onMic: () -> Unit, crash: String? = nul
             }
         }
 
-        Row(row, Arrangement.spacedBy(8.dp), Alignment.CenterVertically) {
-            OutlinedTextField(text, { text = it }, Modifier.weight(1f), singleLine = true, placeholder = { Text("Type to TV") })
+        Row(row, Arrangement.spacedBy(6.dp), Alignment.CenterVertically) {
+            OutlinedTextField(
+                text, { text = it }, Modifier.weight(1f).focusRequester(focus), singleLine = true,
+                placeholder = { Text("Type to TV") },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { t.type(text); text = "" })
+            )
             Button(onClick = { t.type(text); text = "" }) { Text("Send") }
-            B("⌫", 56.dp, 48.dp, rep = true) { t.key(67) }
+            B("⌫", 48.dp, 48.dp, rep = true) { t.key(67) }
+            B("↵", 48.dp, 48.dp) { t.key(66) }
         }
     }
 }
